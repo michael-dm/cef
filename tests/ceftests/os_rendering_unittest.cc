@@ -2620,3 +2620,904 @@ OSR_TEST(TouchMove2x, OSR_TEST_TOUCH_MOVE, 2.0f)
 OSR_TEST(TouchCancel, OSR_TEST_TOUCH_CANCEL, 1.0f)
 OSR_TEST(TouchCancel2x, OSR_TEST_TOUCH_CANCEL, 2.0f)
 OSR_TEST(PenEvent, OSR_TEST_PEN, 1.0f)
+
+// ---------------------------------------------------------------------------
+// Review experiments for PR #4358. Not for upstream.
+#if CEF_API_ADDED(CEF_EXPERIMENTAL)
+#include <cerrno>
+#include <deque>
+#include <sstream>
+#include <thread>
+#if defined(OS_LINUX)
+#include <fcntl.h>
+#include <sys/stat.h>
+#endif
+#if defined(OS_MAC)
+#include <CoreFoundation/CoreFoundation.h>
+#endif
+
+namespace hold_review {
+
+int IntSwitch(const char* name, int default_value) {
+  auto command_line = CefCommandLine::GetGlobalCommandLine();
+  if (!command_line->HasSwitch(name)) {
+    return default_value;
+  }
+  return atoi(command_line->GetSwitchValue(name).ToString().c_str());
+}
+
+double DoubleSwitch(const char* name, double default_value) {
+  auto command_line = CefCommandLine::GetGlobalCommandLine();
+  if (!command_line->HasSwitch(name)) {
+    return default_value;
+  }
+  return atof(command_line->GetSwitchValue(name).ToString().c_str());
+}
+
+// Only a small square animates, so each frame's own damage is small.
+constexpr char kSmallAnimationPage[] = R"(
+  <html><body style="margin:0;background:#ffffff">
+  <div id="d" style="position:fixed;left:0;top:0;width:8px;height:8px"></div>
+  <script>
+  let frame = 0;
+  function animate() {
+    ++frame;
+    document.getElementById('d').style.background =
+        'rgb(' + (frame & 255) + ',' + ((frame >> 8) & 255) + ',0)';
+    requestAnimationFrame(animate);
+  }
+  requestAnimationFrame(animate);
+  </script></body></html>)";
+
+constexpr char kSelectPage[] = R"(
+  <html><body style="margin:0;background:#ffffff">
+  <select id="s" style="position:absolute;left:10px;top:10px;width:120px;
+                        height:24px">
+  <option>1</option><option>2</option><option>3</option><option>4</option>
+  <option>5</option><option>6</option></select></body></html>)";
+
+std::string RectString(const CefRect& rect) {
+  std::stringstream ss;
+  ss << rect.x << "," << rect.y << " " << rect.width << "x" << rect.height;
+  return ss.str();
+}
+
+void Click(CefRefPtr<CefBrowser> browser, int x, int y) {
+  CefMouseEvent event;
+  event.x = x;
+  event.y = y;
+  event.modifiers = 0;
+  browser->GetHost()->SendMouseMoveEvent(event, false);
+  browser->GetHost()->SendMouseClickEvent(event, MBT_LEFT, false, 1);
+  browser->GetHost()->SendMouseClickEvent(event, MBT_LEFT, true, 1);
+}
+
+class Base : public TestHandler, public CefRenderHandler {
+ public:
+  CefRefPtr<CefRenderHandler> GetRenderHandler() override { return this; }
+
+  void GetViewRect(CefRefPtr<CefBrowser> browser, CefRect& rect) override {
+    rect = CefRect(0, 0, width_, height_);
+  }
+
+  bool GetScreenInfo(CefRefPtr<CefBrowser> browser,
+                     CefScreenInfo& screen_info) override {
+    screen_info.device_scale_factor = dsf_;
+    screen_info.rect = CefRect(0, 0, 400, 300);
+    screen_info.available_rect = screen_info.rect;
+    return true;
+  }
+
+  void OnPaint(CefRefPtr<CefBrowser> browser,
+               PaintElementType type,
+               const RectList& dirty_rects,
+               const void* buffer,
+               int width,
+               int height) override {
+    if (!software_) {
+      software_ = true;
+      LOG(ERROR) << "REVIEW: software paint, GPU unavailable";
+      DestroyTest();
+    }
+  }
+
+  void OnAcceleratedPaint(CefRefPtr<CefBrowser> browser,
+                          PaintElementType type,
+                          const RectList& dirty_rects,
+                          const CefAcceleratedPaintInfo& info) override {
+    ++legacy_paints_;
+  }
+
+  void Create(const std::string& url, bool external_begin_frame) {
+    CefWindowInfo window_info;
+    window_info.SetAsWindowless(kNullWindowHandle);
+    window_info.shared_texture_enabled = true;
+    window_info.external_begin_frame_enabled = external_begin_frame;
+    CefBrowserSettings settings;
+    settings.windowless_frame_rate = 60;
+    CefBrowserHost::CreateBrowser(window_info, this, url, settings, nullptr,
+                                  nullptr);
+  }
+
+  void ReleaseHeld() {
+    while (!held_.empty()) {
+      CefPostTask(TID_FILE_USER_VISIBLE,
+                  base::BindOnce([](CefRefPtr<CefCallback> callback) {},
+                                 held_.front()));
+      held_.pop_front();
+    }
+  }
+
+  void DestroyTest() override {
+    done_ = true;
+    TestHandler::DestroyTest();
+  }
+
+ protected:
+  int width_ = 160;
+  int height_ = 120;
+  float dsf_ = 1.0f;
+  bool software_ = false;
+  bool done_ = false;
+  int legacy_paints_ = 0;
+  std::deque<CefRefPtr<CefCallback>> held_;
+};
+
+template <class T>
+void Run() {
+  CefRefPtr<T> handler = new T();
+  handler->ExecuteTest();
+  handler->ReleaseHeld();
+  ReleaseAndWaitForDestructor(handler);
+}
+
+// Holds frames at 60 fps and counts frames lost between capture counters.
+//   --hold-count=N     frames kept between paints, 0 returns false.
+//   --hold-delay-ms=D  instead releases each frame D ms after its paint.
+//   --hold-thread=1    releases on another thread instead of the UI thread.
+//   --hold-seconds=S   measurement length.
+//   --hold-ebf=1       external begin frames at 60 Hz.
+class ThroughputHandler : public Base {
+ public:
+  using Base::OnAcceleratedPaint;
+  void RunTest() override {
+    hold_count_ = IntSwitch("hold-count", 3);
+    delay_ms_ = IntSwitch("hold-delay-ms", 0);
+    other_thread_ = IntSwitch("hold-thread", 0) != 0;
+    seconds_ = IntSwitch("hold-seconds", 3);
+    external_begin_frame_ = IntSwitch("hold-ebf", 0) != 0;
+    SetTestTimeout((seconds_ + 10) * 1000);
+    const char kUrl[] = "https://tests/hold_throughput";
+    AddResource(kUrl, kSmallAnimationPage, "text/html");
+    Create(kUrl, external_begin_frame_);
+    if (external_begin_frame_) {
+      BeginFrame();
+    }
+  }
+
+  void BeginFrame() {
+    if (done_) {
+      return;
+    }
+    if (GetBrowser()) {
+      GetBrowser()->GetHost()->SendExternalBeginFrame();
+    }
+    CefPostDelayedTask(
+        TID_UI, base::BindOnce(&ThroughputHandler::BeginFrame, this), 16);
+  }
+
+  bool OnAcceleratedPaint(CefRefPtr<CefBrowser> browser,
+                          PaintElementType type,
+                          const RectList& dirty_rects,
+                          const CefAcceleratedPaintInfo& info,
+                          CefRefPtr<CefCallback> callback) override {
+    if (type != PET_VIEW || done_) {
+      return true;
+    }
+    Record(info, dirty_rects);
+    if (delay_ms_ > 0) {
+      CefPostDelayedTask(other_thread_ ? TID_FILE_USER_VISIBLE : TID_UI,
+                         base::BindOnce(&CefCallback::Continue, callback),
+                         delay_ms_);
+      return true;
+    }
+    if (hold_count_ == 0) {
+      return false;
+    }
+    held_.push_back(callback);
+    while (held_.size() > static_cast<size_t>(hold_count_)) {
+      if (other_thread_) {
+        CefPostTask(TID_FILE_USER_VISIBLE,
+                    base::BindOnce(&CefCallback::Continue, held_.front()));
+      } else {
+        held_.front()->Continue();
+      }
+      held_.pop_front();
+    }
+    return true;
+  }
+
+ private:
+  void Record(const CefAcceleratedPaintInfo& info,
+              const RectList& dirty_rects) {
+    if (paints_ == 0) {
+      start_ = std::chrono::steady_clock::now();
+      CefPostDelayedTask(TID_UI,
+                         base::BindOnce(&ThroughputHandler::Finish, this),
+                         seconds_ * 1000);
+    }
+    ++paints_;
+    if (!dirty_rects.empty() &&
+        dirty_rects[0] == CefRect(0, 0, info.extra.coded_size.width,
+                                  info.extra.coded_size.height)) {
+      ++full_dirty_;
+    }
+    if (info.extra.has_capture_counter) {
+      if (have_counter_) {
+        const int64_t gap = info.extra.capture_counter - last_counter_ - 1;
+        if (gap > 0) {
+          missed_ += gap;
+          ++gap_events_;
+        } else if (gap < 0) {
+          ++counter_resets_;
+        }
+      }
+      last_counter_ = info.extra.capture_counter;
+      have_counter_ = true;
+    }
+  }
+
+  void Finish() {
+    const double elapsed = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - start_)
+                               .count();
+    LOG(ERROR) << "REVIEW throughput hold=" << hold_count_
+                 << " delay_ms=" << delay_ms_
+                 << " other_thread=" << other_thread_
+                 << " ebf=" << external_begin_frame_ << " paints=" << paints_
+                 << " fps=" << paints_ / elapsed << " missed=" << missed_
+                 << " gap_events=" << gap_events_
+                 << " full_dirty=" << full_dirty_
+                 << " counter_resets=" << counter_resets_
+                 << " legacy=" << legacy_paints_;
+    DestroyTest();
+  }
+
+  int hold_count_ = 0;
+  int delay_ms_ = 0;
+  bool other_thread_ = false;
+  bool external_begin_frame_ = false;
+  int seconds_ = 3;
+  int paints_ = 0;
+  int full_dirty_ = 0;
+  int64_t missed_ = 0;
+  int gap_events_ = 0;
+  int counter_resets_ = 0;
+  bool have_counter_ = false;
+  int64_t last_counter_ = 0;
+  std::chrono::steady_clock::time_point start_;
+
+  IMPLEMENT_REFCOUNTING(ThroughputHandler);
+};
+
+// Holds every frame of a small animation up to the limit, then releases one.
+// The next paint must repaint the whole view.
+//   --hold-dsf=F     device scale factor.
+//   --hold-resize=1  resizes the view to 200x150 while at the limit.
+//   --hold-ebf=1     external begin frames at 60 Hz.
+class RepaintHandler : public Base {
+ public:
+  using Base::OnAcceleratedPaint;
+  void RunTest() override {
+    dsf_ = static_cast<float>(DoubleSwitch("hold-dsf", 1.0));
+    resize_ = IntSwitch("hold-resize", 0) != 0;
+    hide_ = IntSwitch("hold-hide", 0) != 0;
+    external_begin_frame_ = IntSwitch("hold-ebf", 0) != 0;
+    SetTestTimeout(10000);
+    const char kUrl[] = "https://tests/hold_repaint";
+    AddResource(kUrl, kSmallAnimationPage, "text/html");
+    Create(kUrl, external_begin_frame_);
+    if (external_begin_frame_) {
+      BeginFrame();
+    }
+  }
+
+  void BeginFrame() {
+    if (done_) {
+      return;
+    }
+    if (GetBrowser()) {
+      GetBrowser()->GetHost()->SendExternalBeginFrame();
+    }
+    CefPostDelayedTask(TID_UI,
+                       base::BindOnce(&RepaintHandler::BeginFrame, this), 16);
+  }
+
+  bool OnAcceleratedPaint(CefRefPtr<CefBrowser> browser,
+                          PaintElementType type,
+                          const RectList& dirty_rects,
+                          const CefAcceleratedPaintInfo& info,
+                          CefRefPtr<CefCallback> callback) override {
+    if (type != PET_VIEW || done_) {
+      return true;
+    }
+    const auto& extra = info.extra;
+    if (released_) {
+      LOG(ERROR) << "REVIEW repaint dsf=" << dsf_ << " resize=" << resize_
+                   << " hide=" << hide_
+                   << " ebf=" << external_begin_frame_
+                   << " coded=" << extra.coded_size.width << "x"
+                   << extra.coded_size.height
+                   << " visible=" << RectString(extra.visible_rect)
+                   << " content=" << RectString(extra.content_rect)
+                   << " dirty=" << RectString(dirty_rects[0])
+                   << " update_rect=" << RectString(extra.capture_update_rect)
+                   << " counter=" << extra.capture_counter
+                   << " last_held_counter=" << last_counter_;
+      const int expected_width =
+          static_cast<int>(std::ceil((resize_ ? 200 : 160) * dsf_));
+      const int expected_height =
+          static_cast<int>(std::ceil((resize_ ? 150 : 120) * dsf_));
+      EXPECT_EQ(expected_width, extra.coded_size.width);
+      EXPECT_EQ(expected_height, extra.coded_size.height);
+      EXPECT_EQ(CefRect(0, 0, extra.coded_size.width, extra.coded_size.height),
+                dirty_rects[0]);
+      EXPECT_GT(static_cast<int64_t>(extra.capture_counter), last_counter_ + 1)
+          << "no frame was dropped";
+      DestroyTest();
+      return true;
+    }
+    if (held_.size() == kMaxHeldFrames) {
+      ADD_FAILURE() << "paint delivered beyond the limit";
+      return true;
+    }
+    held_.push_back(callback);
+    last_counter_ = static_cast<int64_t>(extra.capture_counter);
+    if (held_.size() == kMaxHeldFrames) {
+      if (resize_) {
+        CefPostDelayedTask(TID_UI,
+                           base::BindOnce(
+                               [](CefRefPtr<RepaintHandler> self) {
+                                 self->width_ = 200;
+                                 self->height_ = 150;
+                                 self->GetBrowser()->GetHost()->WasResized();
+                               },
+                               CefRefPtr<RepaintHandler>(this)),
+                           200);
+      }
+      if (hide_) {
+        CefPostDelayedTask(TID_UI,
+                           base::BindOnce(
+                               [](CefRefPtr<RepaintHandler> self) {
+                                 self->GetBrowser()->GetHost()->WasHidden(true);
+                                 self->GetBrowser()->GetHost()->WasHidden(
+                                     false);
+                               },
+                               CefRefPtr<RepaintHandler>(this)),
+                           300);
+      }
+      CefPostDelayedTask(TID_UI,
+                         base::BindOnce(&RepaintHandler::ReleaseOne, this),
+                         800);
+    }
+    return true;
+  }
+
+  void ReleaseOne() {
+    released_ = true;
+    CefPostTask(TID_FILE_USER_VISIBLE,
+                base::BindOnce(&CefCallback::Continue, held_.back()));
+    held_.pop_back();
+  }
+
+ private:
+  bool resize_ = false;
+  bool hide_ = false;
+  bool external_begin_frame_ = false;
+  bool released_ = false;
+  int64_t last_counter_ = 0;
+
+  IMPLEMENT_REFCOUNTING(RepaintHandler);
+};
+
+// Holds popup frames at the limit, closes the popup, opens another one and
+// counts how many popup frames are then held at once.
+class PopupHandler : public Base {
+ public:
+  using Base::OnAcceleratedPaint;
+  void RunTest() override {
+    SetTestTimeout(15000);
+    const char kUrl[] = "https://tests/hold_popup";
+    AddResource(kUrl, kSelectPage, "text/html");
+    Create(kUrl, false);
+  }
+
+  void OnPopupShow(CefRefPtr<CefBrowser> browser, bool show) override {
+    LOG(ERROR) << "REVIEW popup show=" << show << " held=" << held_.size();
+    if (!show && phase_ == 1) {
+      phase_ = 2;
+      CefPostDelayedTask(TID_UI,
+                         base::BindOnce(&PopupHandler::OpenAgain, this), 500);
+    }
+  }
+
+  void OnPopupSize(CefRefPtr<CefBrowser> browser,
+                   const CefRect& rect) override {}
+
+  bool OnAcceleratedPaint(CefRefPtr<CefBrowser> browser,
+                          PaintElementType type,
+                          const RectList& dirty_rects,
+                          const CefAcceleratedPaintInfo& info,
+                          CefRefPtr<CefCallback> callback) override {
+    if (done_) {
+      return true;
+    }
+    if (type == PET_VIEW) {
+      if (!clicked_) {
+        clicked_ = true;
+        CefPostDelayedTask(TID_UI,
+                           base::BindOnce(
+                               [](CefRefPtr<PopupHandler> self) {
+                                 Click(self->GetBrowser(), 50, 20);
+                               },
+                               CefRefPtr<PopupHandler>(this)),
+                           500);
+      }
+      return false;
+    }
+    held_.push_back(callback);
+    ++popup_paints_[phase_];
+    LOG(ERROR) << "REVIEW popup paint phase=" << phase_
+                 << " held=" << held_.size() << " coded="
+                 << info.extra.coded_size.width << "x"
+                 << info.extra.coded_size.height;
+    browser->GetHost()->Invalidate(PET_POPUP);
+    if (phase_ == 0 && popup_paints_[0] == 4) {
+      phase_ = 1;
+      // Close the popup with frames held.
+      CefPostDelayedTask(TID_UI,
+                         base::BindOnce(
+                             [](CefRefPtr<PopupHandler> self) {
+                               Click(self->GetBrowser(), 300, 250);
+                             },
+                             CefRefPtr<PopupHandler>(this)),
+                         500);
+    }
+    if (phase_ == 2 && popup_paints_[2] == 4) {
+      phase_ = 3;
+      CefPostDelayedTask(TID_UI, base::BindOnce(&PopupHandler::Finish, this),
+                         500);
+    }
+    return true;
+  }
+
+  void OpenAgain() { Click(GetBrowser(), 50, 20); }
+
+  void Finish() {
+    LOG(ERROR) << "REVIEW popup first=" << popup_paints_[0]
+                 << " during_close=" << popup_paints_[1]
+                 << " second=" << popup_paints_[2]
+                 << " after=" << popup_paints_[3]
+                 << " held_at_once=" << held_.size();
+    // Release the frames of both popups from another thread, after the first
+    // popup's view is gone.
+    ReleaseHeld();
+    CefPostDelayedTask(TID_UI, base::BindOnce(&PopupHandler::DestroyTest, this),
+                       500);
+  }
+
+ private:
+  bool clicked_ = false;
+  int phase_ = 0;
+  int popup_paints_[4] = {};
+
+  IMPLEMENT_REFCOUNTING(PopupHandler);
+};
+
+// Holds view frames at the limit, then navigates cross-site, and counts how
+// many view frames are then held at once.
+class NavigateHandler : public Base {
+ public:
+  using Base::OnAcceleratedPaint;
+  void RunTest() override {
+    SetTestTimeout(15000);
+    pixel_reader_ = osr_unittests::CreateSharedTexturePixelReader();
+    EXPECT_TRUE(pixel_reader_->Initialize());
+    AddResource("https://tests/hold_nav_a",
+                "<html><body style='background:#ff0000'></body></html>",
+                "text/html");
+    AddResource("https://other.test/hold_nav_b",
+                "<html><body style='background:#0000ff'></body></html>",
+                "text/html");
+    Create("https://tests/hold_nav_a", false);
+  }
+
+  bool OnAcceleratedPaint(CefRefPtr<CefBrowser> browser,
+                          PaintElementType type,
+                          const RectList& dirty_rects,
+                          const CefAcceleratedPaintInfo& info,
+                          CefRefPtr<CefCallback> callback) override {
+    if (type != PET_VIEW || done_) {
+      return true;
+    }
+    uint32_t marker = 0;
+    uint32_t center = 0;
+    pixel_reader_->Read(info, &marker, &center);
+    const bool red = marker == 0xffff0000U;
+    const bool blue = marker == 0xff0000ffU;
+    if (!navigated_) {
+      if (!red) {
+        browser->GetHost()->Invalidate(PET_VIEW);
+        return true;
+      }
+      held_.push_back(callback);
+      browser->GetHost()->Invalidate(PET_VIEW);
+      if (held_.size() == 4) {
+        navigated_ = true;
+        CefPostDelayedTask(TID_UI,
+                           base::BindOnce(
+                               [](CefRefPtr<NavigateHandler> self) {
+                                 self->GetBrowser()->GetMainFrame()->LoadURL(
+                                     "https://other.test/hold_nav_b");
+                               },
+                               CefRefPtr<NavigateHandler>(this)),
+                           300);
+      }
+      return true;
+    }
+    LOG(ERROR) << "REVIEW nav paint marker=" << std::hex << marker
+                 << std::dec << " held=" << held_.size();
+    if (!blue) {
+      // Paints of the old page are dropped at the limit.
+      return true;
+    }
+    held_.push_back(callback);
+    browser->GetHost()->Invalidate(PET_VIEW);
+    if (held_.size() == 8) {
+      LOG(ERROR) << "REVIEW nav held_at_once=" << held_.size();
+      DestroyTest();
+    }
+    return true;
+  }
+
+  void DestroyTest() override {
+    if (pixel_reader_) {
+      pixel_reader_->Cleanup();
+      pixel_reader_.reset();
+    }
+    Base::DestroyTest();
+  }
+
+ private:
+  bool navigated_ = false;
+  std::unique_ptr<osr_unittests::SharedTexturePixelReader> pixel_reader_;
+
+  IMPLEMENT_REFCOUNTING(NavigateHandler);
+};
+
+std::vector<CefRefPtr<CefCallback>>* g_leaked = nullptr;
+int g_leak_mode = 0;
+
+struct LeakReleaser {
+  ~LeakReleaser() {
+    if (!g_leaked) {
+      return;
+    }
+    const int mode = g_leak_mode;
+    fprintf(stderr, "REVIEW releasing %zu callbacks after CefShutdown mode=%d\n",
+            g_leaked->size(), mode);
+    if (mode == 1) {
+      std::thread([] { g_leaked->clear(); }).join();
+    } else if (mode == 0) {
+      g_leaked->clear();
+    }
+    fprintf(stderr, "REVIEW released after CefShutdown\n");
+  }
+};
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+LeakReleaser g_leak_releaser;
+#pragma clang diagnostic pop
+
+// Keeps held frames past CefShutdown.
+//   --hold-leak-mode=0  releases them on the main thread at exit.
+//   --hold-leak-mode=1  releases them from another thread at exit.
+//   --hold-leak-mode=2  never releases them.
+class LeakHandler : public Base {
+ public:
+  using Base::OnAcceleratedPaint;
+  void RunTest() override {
+    g_leak_mode = IntSwitch("hold-leak-mode", 0);
+    SetTestTimeout(10000);
+    const char kUrl[] = "https://tests/hold_leak";
+    AddResource(kUrl, kSmallAnimationPage, "text/html");
+    Create(kUrl, false);
+  }
+
+  bool OnAcceleratedPaint(CefRefPtr<CefBrowser> browser,
+                          PaintElementType type,
+                          const RectList& dirty_rects,
+                          const CefAcceleratedPaintInfo& info,
+                          CefRefPtr<CefCallback> callback) override {
+    if (type != PET_VIEW || done_) {
+      return true;
+    }
+    if (!g_leaked) {
+      g_leaked = new std::vector<CefRefPtr<CefCallback>>();
+    }
+    g_leaked->push_back(callback);
+    if (g_leaked->size() == 4) {
+      CefPostDelayedTask(TID_UI, base::BindOnce(&LeakHandler::DestroyTest, this),
+                         300);
+    }
+    return true;
+  }
+
+ private:
+  IMPLEMENT_REFCOUNTING(LeakHandler);
+};
+
+// Executes the callback within the paint and returns false: documented misuse.
+class ContinueThenFalseHandler : public Base {
+ public:
+  using Base::OnAcceleratedPaint;
+  void RunTest() override {
+    SetTestTimeout(10000);
+    const char kUrl[] = "https://tests/hold_misuse";
+    AddResource(kUrl, kSmallAnimationPage, "text/html");
+    Create(kUrl, false);
+  }
+
+  bool OnAcceleratedPaint(CefRefPtr<CefBrowser> browser,
+                          PaintElementType type,
+                          const RectList& dirty_rects,
+                          const CefAcceleratedPaintInfo& info,
+                          CefRefPtr<CefCallback> callback) override {
+    if (type != PET_VIEW || done_ || misused_) {
+      return true;
+    }
+    misused_ = true;
+#if defined(OS_LINUX)
+    fd_ = info.planes[0].fd;
+    struct stat st;
+    fd_valid_before_ = fcntl(fd_, F_GETFD) != -1 && fstat(fd_, &st) == 0;
+    inode_before_ = st.st_ino;
+#elif defined(OS_MAC)
+    retain_count_before_ =
+        CFGetRetainCount(static_cast<CFTypeRef>(info.shared_texture_io_surface));
+#endif
+    callback->Continue();
+    return false;
+  }
+
+  void OnAcceleratedPaint(CefRefPtr<CefBrowser> browser,
+                          PaintElementType type,
+                          const RectList& dirty_rects,
+                          const CefAcceleratedPaintInfo& info) override {
+    if (done_) {
+      return;
+    }
+#if defined(OS_LINUX)
+    struct stat st;
+    const bool valid = fcntl(fd_, F_GETFD) != -1 && fstat(fd_, &st) == 0;
+    LOG(ERROR) << "REVIEW misuse fd=" << fd_
+                 << " valid_before=" << fd_valid_before_
+                 << " valid_in_fallback=" << valid
+                 << " same_inode=" << (valid && st.st_ino == inode_before_)
+                 << " errno=" << errno;
+#elif defined(OS_MAC)
+    LOG(ERROR) << "REVIEW misuse io_surface retain count before Continue="
+                 << retain_count_before_
+                 << " (1 means the fallback receives a freed IOSurfaceRef)";
+#endif
+    DestroyTest();
+  }
+
+ private:
+  bool misused_ = false;
+#if defined(OS_LINUX)
+  int fd_ = -1;
+  bool fd_valid_before_ = false;
+  ino_t inode_before_ = 0;
+#elif defined(OS_MAC)
+  long retain_count_before_ = 0;
+#endif
+
+  IMPLEMENT_REFCOUNTING(ContinueThenFalseHandler);
+};
+
+// Holds 4 frames, executes one of them several times from several threads and
+// drops it, then counts paints: exactly one more frame fits under the limit.
+class DoubleReleaseHandler : public Base {
+ public:
+  using Base::OnAcceleratedPaint;
+
+  void RunTest() override {
+    SetTestTimeout(10000);
+    const char kUrl[] = "https://tests/hold_double";
+    AddResource(kUrl, kSmallAnimationPage, "text/html");
+    Create(kUrl, false);
+  }
+
+  bool OnAcceleratedPaint(CefRefPtr<CefBrowser> browser,
+                          PaintElementType type,
+                          const RectList& dirty_rects,
+                          const CefAcceleratedPaintInfo& info,
+                          CefRefPtr<CefCallback> callback) override {
+    if (type != PET_VIEW || done_) {
+      return true;
+    }
+    held_.push_back(callback);
+    if (released_) {
+      ++paints_after_release_;
+    } else if (held_.size() == 4) {
+      CefPostDelayedTask(TID_UI,
+                         base::BindOnce(&DoubleReleaseHandler::ReleaseOne, this),
+                         300);
+    }
+    return true;
+  }
+
+  void ReleaseOne() {
+    released_ = true;
+    CefRefPtr<CefCallback> callback = held_.front();
+    held_.pop_front();
+    callback->Continue();
+    callback->Cancel();
+    CefPostTask(TID_FILE_USER_VISIBLE,
+                base::BindOnce(&CefCallback::Continue, callback));
+    CefPostTask(TID_IO, base::BindOnce(&CefCallback::Cancel, callback));
+    CefPostTask(TID_FILE_USER_BLOCKING,
+                base::BindOnce(&CefCallback::Continue, callback));
+    CefPostDelayedTask(TID_UI,
+                       base::BindOnce(&DoubleReleaseHandler::Finish, this),
+                       1000);
+  }
+
+  void Finish() {
+    LOG(ERROR) << "REVIEW double release paints_after_release="
+               << paints_after_release_ << " held=" << held_.size();
+    EXPECT_EQ(1, paints_after_release_);
+    DestroyTest();
+  }
+
+ private:
+  bool released_ = false;
+  int paints_after_release_ = 0;
+
+  IMPLEMENT_REFCOUNTING(DoubleReleaseHandler);
+};
+
+// Holds 2 frames, crashes the GPU process, then checks that painting resumes
+// and that the held frames still read back.
+class GpuCrashHandler : public Base {
+ public:
+  using Base::OnAcceleratedPaint;
+
+  void RunTest() override {
+    SetTestTimeout(20000);
+    pixel_reader_ = osr_unittests::CreateSharedTexturePixelReader();
+    EXPECT_TRUE(pixel_reader_->Initialize());
+    const char kUrl[] = "https://tests/hold_gpu_crash";
+    AddResource(kUrl, "<html><body style='background:#ff0000'></body></html>",
+                "text/html");
+    Create(kUrl, false);
+  }
+
+  bool OnAcceleratedPaint(CefRefPtr<CefBrowser> browser,
+                          PaintElementType type,
+                          const RectList& dirty_rects,
+                          const CefAcceleratedPaintInfo& info,
+                          CefRefPtr<CefCallback> callback) override {
+    if (type != PET_VIEW || done_) {
+      return true;
+    }
+    uint32_t marker = 0;
+    uint32_t center = 0;
+    const bool read = pixel_reader_->Read(info, &marker, &center);
+    if (crashed_) {
+      LOG(ERROR) << "REVIEW gpu crash: paint after crash read=" << read
+                 << " marker=" << std::hex << marker << std::dec
+                 << " held=" << held_.size();
+      ++paints_after_crash_;
+      if (paints_after_crash_ == 1) {
+        for (auto& frame : held_infos_) {
+          uint32_t held_marker = 0;
+          const bool held_read =
+              pixel_reader_->Read(frame, &held_marker, &center);
+          LOG(ERROR) << "REVIEW gpu crash: held frame read=" << held_read
+                     << " marker=" << std::hex << held_marker << std::dec;
+        }
+        CefPostDelayedTask(TID_UI,
+                           base::BindOnce(&GpuCrashHandler::Finish, this), 500);
+      }
+      browser->GetHost()->Invalidate(PET_VIEW);
+      return true;
+    }
+    if (marker != 0xffff0000U) {
+      browser->GetHost()->Invalidate(PET_VIEW);
+      return true;
+    }
+    held_.push_back(callback);
+    held_infos_.push_back(info);
+    if (held_.size() < 2) {
+      browser->GetHost()->Invalidate(PET_VIEW);
+      return true;
+    }
+    crashed_ = true;
+    CefPostDelayedTask(TID_UI,
+                       base::BindOnce(
+                           [](CefRefPtr<GpuCrashHandler> self) {
+                             self->GetBrowser()->GetMainFrame()->LoadURL(
+                                 "chrome://gpucrash");
+                           },
+                           CefRefPtr<GpuCrashHandler>(this)),
+                       200);
+    // Keep painting after the GPU process restarts.
+    CefPostDelayedTask(TID_UI,
+                       base::BindOnce(&GpuCrashHandler::Poke, this), 1000);
+    return true;
+  }
+
+  void Poke() {
+    if (done_ || paints_after_crash_ > 0) {
+      return;
+    }
+    GetBrowser()->GetHost()->Invalidate(PET_VIEW);
+    CefPostDelayedTask(TID_UI, base::BindOnce(&GpuCrashHandler::Poke, this),
+                       500);
+  }
+
+  void Finish() {
+    LOG(ERROR) << "REVIEW gpu crash paints_after_crash=" << paints_after_crash_
+               << " legacy=" << legacy_paints_ << " software=" << software_;
+    ReleaseHeld();
+    CefPostDelayedTask(TID_UI,
+                       base::BindOnce(&GpuCrashHandler::DestroyTest, this),
+                       500);
+  }
+
+  void DestroyTest() override {
+    if (pixel_reader_) {
+      pixel_reader_->Cleanup();
+      pixel_reader_.reset();
+    }
+    Base::DestroyTest();
+  }
+
+ private:
+  bool crashed_ = false;
+  int paints_after_crash_ = 0;
+  std::vector<CefAcceleratedPaintInfo> held_infos_;
+  std::unique_ptr<osr_unittests::SharedTexturePixelReader> pixel_reader_;
+
+  IMPLEMENT_REFCOUNTING(GpuCrashHandler);
+};
+
+}  // namespace hold_review
+
+TEST(OSRHoldReview, Throughput) {
+  hold_review::Run<hold_review::ThroughputHandler>();
+}
+TEST(OSRHoldReview, Repaint) {
+  hold_review::Run<hold_review::RepaintHandler>();
+}
+TEST(OSRHoldReview, Popup) {
+  hold_review::Run<hold_review::PopupHandler>();
+}
+TEST(OSRHoldReview, Navigate) {
+  hold_review::Run<hold_review::NavigateHandler>();
+}
+TEST(OSRHoldReview, Leak) {
+  hold_review::Run<hold_review::LeakHandler>();
+}
+TEST(OSRHoldReview, DoubleRelease) {
+  hold_review::Run<hold_review::DoubleReleaseHandler>();
+}
+TEST(OSRHoldReview, GpuCrash) {
+  hold_review::Run<hold_review::GpuCrashHandler>();
+}
+TEST(OSRHoldReview, ContinueThenFalse) {
+  hold_review::Run<hold_review::ContinueThenFalseHandler>();
+}
+#endif  // CEF_API_ADDED(CEF_EXPERIMENTAL)

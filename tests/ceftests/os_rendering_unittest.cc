@@ -2858,6 +2858,14 @@ class ThroughputHandler : public Base {
         if (gap > 0) {
           missed_ += gap;
           ++gap_events_;
+          if (gap_events_ <= 3) {
+            LOG(ERROR) << "REVIEW gap of " << gap << " at paint " << paints_
+                       << " after "
+                       << std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - start_)
+                              .count()
+                       << " ms";
+          }
         } else if (gap < 0) {
           ++counter_resets_;
         }
